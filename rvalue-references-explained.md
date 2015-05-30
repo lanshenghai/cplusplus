@@ -255,6 +255,230 @@ std::move是一个非常简单的函数。不幸的是，我不能给你列出�
 
 将会变得危险、混乱和易于出错，因为被我们移动过的事物，也就是，我们刚剽窃的事物，在后续的代码中，仍然可以被访问。但是move语法的整个关键点是：只有在它“没有关系”的地方使用它。意思是说：我们移动过的事物已经无效，并且移动之后就离开了。因此，规则是，“如果它有一个名字，那么它就是左值”。
 
+那么剩下部分呢？“如果它没有名字，那么它是一个右值？”看上面的goo例子，它是技术上可行的，尽管非常不现实，例子的第二行goo()表达式引用的事物，在它被移动以后仍然可见。但是回顾前面章节：有时这就是我们想要的！我们想基于我们自己的判断来决定是否可以在左值上强制使用move语法，并且精确的规则定义是：“如果它没有名字，那么它是一个右值”，允许我们自己可以控制这种行为。这就是函数std::move的工作原理。尽管有时候它太早地呈现给我们确切的实现方式，我们仅仅对理解std::move靠近了一步。它通过引用传递正确的参数，其它什么事情都不做，并且它的结果类型是一个右值引用。所以表达式
+
+    std::move(x)
+
+被声明成一个右值引用，并且没有名字。因此，它是一个右值。所以，std::move“把它的输入参数转化成右值，即使输出参数不是一个右值”，它是通过“隐藏名字”实现了这个目的。
+
+这儿有一个例子给出了if-it-has-a-name规则是有多么的重要。假设有已经写了一个类Base，并且你已经通过重载Base的拷贝构造函数和赋值运算符实现了move语法：
+
+    Base(Base const & rhs); // non-move semantics
+    Base(Base&& rhs); // move semantics
+
+ 现在你写一个类Derived，它继承自Base。为了确保move语法会被用到你的Derived对象的Base部分上，你必须同样重载Derived的拷贝构造和赋值运算符。让我们看看拷贝构造函数。拷贝赋值运算符的处理方式类似。左值版本比较直白：
+
+    Derived(Derived const & rhs) 
+      : Base(rhs)
+    {
+      // Derived-specific stuff
+    }
+ 
+ 右值版本比较大，也比较微妙。一个没有意识到if-it-has-a-name规则的人可能写成：
+
+    Derived(Derived&& rhs) 
+      : Base(rhs) // wrong: rhs is an lvalue
+    {
+      // Derived-specific stuff
+    }
+
+如果我们把代码写成这样，那么Base拷贝构造函数的非move语法的版本会被调用，因此rhs有一个名字，它是一个左值。我们想调用的是Base拷贝构造函数的move语法版本，可以把代码写成这样来达到目的：
+
+    Derived(Derived&& rhs) 
+      : Base(std::move(rhs)) // good, calls Base(Base&& rhs)
+    {
+      // Derived-specific stuff
+    }
+ 
+move语法和编译优化
+==================
+考虑下面的函数定义：
+    X foo()
+    {
+      X x;
+      // perhaps do something to x
+      return x;
+    }
+
+现在按照之前的假设，X是一个类，我们重载了它的拷贝构造函数和负值运算符来实现了move语法。如果你按照函数定义的表面来理解，你可能会说，等一等，那儿有一个值拷贝发生在从x到foo的返回值。相应的，让我们确保我们在使用move语法：
+
+    X foo()
+    {
+      X x;
+      // perhaps do something to x
+      return std::move(x); // making it worse!
+    }
+
+不幸的是，这会让事情变得更糟糕，而不是更好。任何一个现代编译器都是使用*返回值优化*到原始的函数定义上。换句话说，它并不是在本地构造一个X，然后把它拷贝出去，编译器会直接在返回值得地方构造一个X对象。很明显，这个比move语法更好。
+
+因此就像你看到的，为了以优化的方式用到右值引用和move语法，你必须完全了解并考虑今天编译器的“副作用”，就像返回值优化和节省拷贝。在Scott Meyers的“Effective Modern C++”一书的第25和41条例有详细的讨论。它变得很微妙，但是，嗨，我们选择C++作为我们的语言是有原因的，对吗？我们制造自己的床，所以，现在让我们躺在上面。
+
+完美传递：问题
+================
+move语法的另一个问题是右值引用是被设计用来解决完美的传递问题。考虑下面简单的工厂函数：
+
+    template<typename T, typename Arg> 
+    shared_ptr<T> factory(Arg arg)
+    { 
+      return shared_ptr<T>(new T(arg));
+    } 
+ 
+ 很明显，这儿的意思是从工厂方法里传递参数arg到T的构造函数。理想情况下，一切事情应该就像工厂函数不存在那样，拷贝构造在客户代码的地方被直接调用：完美传递。可悲的是上面的代码会失败在：它通过值引入了一个额外的调用，如果构造函数参数是一个引用，它就会变得很糟糕。
+
+对常见的解决方案是，像boost::bing的那样，让外面的函数以引用方式接受参数：
+
+    template<typename T, typename Arg> 
+    shared_ptr<T> factory(Arg& arg)
+    { 
+      return shared_ptr<T>(new T(arg));
+    } 
+
+这会好些，但是不完美。问题是：现在，工厂函数不能被以右值方式调用：
+
+    factory<X>(hoo()); // error if hoo returns by value
+    factory<X>(41); // error
+
+这个问题可以通过提供常量引用作为参数的重载来解决：
+
+    template<typename T, typename Arg> 
+    shared_ptr<T> factory(Arg const & arg)
+    { 
+      return shared_ptr<T>(new T(arg));
+    } 
+
+这个方法有两个问题。第一，如果factory不是只有一个参数，而是几个，你必须提供所有非常量和常量引用的组合作为参数的重载。因此，对于有几个参数的函数，这个方案变得非常糟糕。
+
+第二，这种传递变得不那么完美是因为他阻碍了使用move语法：在factory函数体内，T的构造函数参数是一个左值。因此，move语法永远不会发生，即使没有那个包装函数。
+
+右值引用可以被用来解决这些问题。在不需要使用重载的情况下，它可以达到完美的传递。为了理解原理，我们需要看一下另外两条右值引用的规则.
+
+完美传递：解决方案
+=================
+剩余两条右值引用规则的第一条也会影响老格式的左值引用。回忆一下在C++11之前，引用的引用是不被允许的：优势像A& &会导致一个编译错误。相反，C++11引入了下面的引用塌陷原则：
+
+ * A& &变成A&
+ * A& &&变成A&
+ * A&& &变成A&
+ * A&& &&变成A&
+
+第二，对一个把右值引用作为模板参数的函数模板，有一个特殊的模板参数推演原则：
+
+    template<typename T>
+    void foo(T&&);
+
+适用于下面情况：
+
+ 1. 当foo以A类型的左值被调用时，T会被解释成A&，并且，参考上面的引用塌陷原则，参数类型有效的变成了A&。 
+ 2. 当foo以A类型的右值被调用时，T会被解释成A，并且，参数类型变成了A&&
+
+按照这些原则，我们现在可以使用右值引用来解决完美传递问题，就像前面章节提到的。解决方案看起来像这样：
+
+    template<typename T, typename Arg> 
+    shared_ptr<T> factory(Arg&& arg)
+    { 
+      return shared_ptr<T>(new T(std::forward<Arg>(arg)));
+    } 
+    where std::forward is defined as follows:
+    template<class S>
+    S&& forward(typename remove_reference<S>::type& a) noexcept
+    {
+      return static_cast<S&&>(a);
+    } 
+ 
+ （现在不用注意noexcept关键字。它让编译器知道，对于特定优化目的，这个函数永远不会抛出异常。我们在第9章会回到这点。）为了看到上面的代码怎么实现完美传递，我们会分开讨论当我们的工厂函数分别被左值调用和右值调用时会发生什么情况。设A和X是类型。假设factory<A>会被类型X的左值方式调用：
+
+    X x;
+    factory<A>(x);
+
+然后，通过上面特殊模板推演原则，factory的模板参数Arg被解析成X&。因此，编译器把factory和std::forward实例化成下面的样子：
+
+    shared_ptr<A> factory(X& && arg)
+    { 
+      return shared_ptr<A>(new A(std::forward<X&>(arg)));
+    } 
+
+    X& && forward(remove_reference<X&>::type& a) noexcept
+    {
+      return static_cast<X& &&>(a);
+    } 
+
+在解析remove_reference之后和应用完引用塌陷原则，会变成：
+
+    shared_ptr<A> factory(X& arg)
+    { 
+      return shared_ptr<A>(new A(std::forward<X&>(arg)));
+    } 
+
+    X& std::forward(X& a) 
+    {
+      return static_cast<X&>(a);
+    } 
+
+这一定可以完成左值的完美传递：工厂函数的参数arg通过两级间接地传递给A构造函数，都是老风格的左值引用。
+
+下一步，通过上面的特殊模板推演原则，factory的模板参数Arg解析成X。因此，编译器现在会创建下面的函数模版实例：
+
+    shared_ptr<A> factory(X&& arg)
+    { 
+      return shared_ptr<A>(new A(std::forward<X>(arg)));
+    } 
+
+    X&& forward(X& a) noexcept
+    {
+      return static_cast<X&&>(a);
+    } 
+
+这简直是一个右值的完美传递：工厂函数的参数通过两级间接地传递给A的构造函数，都是引用。此为，A的构造函数会看到它的参数是一个被声明成右值引用的表达式，并且没有名字。通过no-name原则，这个事物是一个右值。因此，A的构造函数通过右值被调用。这意思是相比不提供工厂包装，这个传递节省了很多move语法。
+
+它可能什么都不值，保留move语法实际上只是为了std::forward的上下文。没有使用std::forward的话，一切都工作的非常正常，除了A的构造函数总是看到它的参数有一个名字，并且它是一个左值。另一种解释是std::forward的目的是传递信息，不论在什么调用地方，包装器总是看到一个左值或右值。
+
+如果你为了更多信心想去挖的更深，问你自己一个问题：为什么需要remove_reference在std::forward的定义里面？答案是，它根本不是真正必须的。在std::forward的定义里，如果你仅仅用S&代替remove_reference<S>::type&，你能重复上面的情况来说服自己完美传递仍然工作。然而，它完美工作的前提是我们显式的特殊化Arg为std::forward的一个模板参数。在std::forward定义里，remove_reference的目的是强制我们那么做。
+
+庆祝一下，我们基本快搞完了。只剩下查看std::move的实现了。记住，std::move的目的是把一个参数通过引用传递给它，然后绑定成一个右值。这儿是它的实现：
+
+    template<class T> 
+    typename remove_reference<T>::type&&
+    std::move(T&& a) noexcept
+    {
+      typedef typename remove_reference<T>::type&& RvalRef;
+      return static_cast<RvalRef>(a);
+    } 
+
+假定我们用类型X的左值调用std::move：
+
+    X x;
+    std::move(x);
+
+通过新的特殊模板推演原则，模板参数T会被解析成X&。因此，编译器会实例化成：
+
+    typename remove_reference<X&>::type&&
+    std::move(X& && a) noexcept
+    {
+      typedef typename remove_reference<X&>::type&& RvalRef;
+      return static_cast<RvalRef>(a);
+    } 
+
+在解析完remove_reference和应用新的引用塌陷原则之后，这个变成：
+
+    X&& std::move(X& a) noexcept
+    {
+      return static_cast<X&&>(a);
+    } 
+
+完成了功能：我们的左值x会被绑定到左值引用上，它是参数类型，并且函数透传它，把它变成了一个没有名字右值引用。
+
+我把怎么说服你自己关于std::move在右值的时候工作也正常留给你。当你可以跳过：为什么一些人想在右值上调用std::move，但他们目的仅仅是把事物转成右值？另外，到现在，你可能注意到除了：
+
+    std::move(x);
+
+你也可以写成：
+
+static_cast<X&&>(x);
+
+然而，std::move还是强烈推荐，因为它非常有表现力。
 
 
+这儿描述的引用塌陷原则是正确的，但不是完整的。我忽略了一个和我们上下文无关的小细节，也就是说，在引用塌陷时，const和volatile修饰符的消失。在Scott Meyer's "Effective Modern C++"的modification history and errata页面有完整解释。
+
+ 
  > Written with [StackEdit](https://stackedit.io/).
